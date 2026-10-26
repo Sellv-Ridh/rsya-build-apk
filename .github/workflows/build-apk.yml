@@ -1,0 +1,1070 @@
+name: Build APK (RSYA)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag yang berisi project.zip
+        required: true
+        type: string
+      flutter_version:
+        description: Versi Flutter (kosong = stable terbaru)
+        required: false
+        default: ''
+        type: string
+      split_abi:
+        description: Pisahkan APK per ABI (true/false)
+        required: false
+        default: 'true'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Flutter APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Setup - bersihkan disk runner
+        shell: bash
+        run: |
+          echo "Disk sebelum dibersihkan:"; df -h / | tail -1
+          # Hapus toolchain bawaan runner yang tidak dipakai Flutter/Android (±25-30 GB)
+          for d in /usr/share/dotnet /usr/local/share/boost /opt/ghc /usr/local/.ghcup /usr/share/swift \
+                   /opt/hostedtoolcache/CodeQL /usr/local/julia* /usr/share/miniconda /opt/microsoft \
+                   /usr/local/share/powershell /usr/local/share/chromium /opt/az /usr/lib/google-cloud-sdk \
+                   /usr/lib/mono /usr/local/lib/heroku /usr/share/kotlinc; do
+            sudo rm -rf $d &
+          done
+          sudo docker system prune -af > /dev/null 2>&1 &
+          sudo apt-get clean > /dev/null 2>&1 &
+          wait
+          echo "Disk setelah dibersihkan:"; df -h / | tail -1
+
+      - name: Setup - unduh dan ekstrak ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RSYA GITHUB BUILDER"
+          mkdir -p "$RUNNER_TEMP/dl" project_raw
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "project.zip" --dir "$RUNNER_TEMP/dl" --clobber
+          unzip -q "$RUNNER_TEMP/dl/project.zip" -d project_raw
+          PUB=$(find project_raw -maxdepth 4 -name pubspec.yaml -not -path '*/.*' -not -path '*/build/*' -printf '%d %p\n' | sort -n | head -n 1 | cut -d' ' -f2-)
+          if [ -z "$PUB" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP"
+            exit 1
+          fi
+          DIR="$(pwd)/$(dirname "$PUB")"
+          echo "Project ditemukan di: $DIR"
+          rm -rf "$DIR/build" "$DIR/.dart_tool" "$DIR/android/.gradle"
+          echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+
+      - name: Setup - deteksi base Flutter
+        shell: bash
+        env:
+          INPUT_FLUTTER: ${{ inputs.flutter_version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+
+          root = os.environ["PROJECT_DIR"]
+          stop = os.environ.get("GITHUB_WORKSPACE", os.path.dirname(root))
+          manual = os.environ.get("INPUT_FLUTTER", "").strip()
+
+          # Flutter stable -> versi Dart SDK bawaannya (major, minor)
+          TABLE = [
+              ((3, 0), (2, 17)), ((3, 3), (2, 18)), ((3, 7), (2, 19)), ((3, 10), (3, 0)),
+              ((3, 13), (3, 1)), ((3, 16), (3, 2)), ((3, 19), (3, 3)), ((3, 22), (3, 4)),
+              ((3, 24), (3, 5)), ((3, 27), (3, 6)), ((3, 29), (3, 7)), ((3, 32), (3, 8)),
+              ((3, 35), (3, 9)), ((3, 38), (3, 10)),
+          ]
+
+          def read(path):
+              try:
+                  with open(path, encoding="utf-8", errors="replace") as f:
+                      return f.read()
+              except OSError:
+                  return ""
+
+          def norm(v):
+              m = re.match(r"^v?(\d+)\.(\d+)(?:\.(\d+))?", str(v).strip())
+              if not m:
+                  return None
+              return "%s.%s.%s" % (m.group(1), m.group(2), m.group(3) or "x")
+
+          def fvm_in(d):
+              t = read(os.path.join(d, ".fvmrc"))
+              if t:
+                  try:
+                      v = norm(json.loads(t).get("flutter", ""))
+                  except ValueError:
+                      v = None
+                  if v:
+                      return v, ".fvmrc"
+              t = read(os.path.join(d, ".fvm", "fvm_config.json"))
+              if t:
+                  try:
+                      v = norm(json.loads(t).get("flutterSdkVersion", ""))
+                  except ValueError:
+                      v = None
+                  if v:
+                      return v, ".fvm/fvm_config.json"
+              m = re.search(r"(?m)^flutter\s+(\S+)", read(os.path.join(d, ".tool-versions")))
+              if m and norm(m.group(1)):
+                  return norm(m.group(1)), ".tool-versions"
+              return None
+
+          def upper_bound(c):
+              m = re.search(r"<=?\s*(\d+)\.(\d+)(?:\.(\d+))?", c)
+              if m:
+                  return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+              m = re.search(r"\^\s*(\d+)", c)
+              if m:
+                  return (int(m.group(1)) + 1, 0, 0)
+              return None
+
+          ver, src = "", ""
+          explicit = False
+
+          # Urutan: 1 input pengguna, 2 FVM/asdf, 3 pubspec flutter pin, 4 base saat project dibuat, 5 batas atas Dart, 6 stable terbaru
+          # 1. Input manual dari aplikasi
+          if manual and norm(manual):
+              ver, src = norm(manual), "input pengguna"
+              explicit = True
+
+          # 2. FVM / asdf (.fvmrc, .fvm/fvm_config.json, .tool-versions)
+          if not ver:
+              d = root
+              while True:
+                  r = fvm_in(d)
+                  if r:
+                      ver, src = r
+                      explicit = True
+                      break
+                  parent = os.path.dirname(d)
+                  if os.path.abspath(d) == os.path.abspath(stop) or parent == d:
+                      break
+                  d = parent
+
+          # 3. pubspec.yaml
+          pub = read(os.path.join(root, "pubspec.yaml"))
+          m = re.search(r"(?ms)^environment:[ \t]*\n((?:[ \t]+[^\n]*\n?|[ \t]*\n)+)", pub)
+          env = m.group(1) if m else ""
+          sdk = re.search(r"(?m)^[ \t]+sdk:[ \t]*[\"']?([^\"'\n#]+)", env)
+          fl = re.search(r"(?m)^[ \t]+flutter:[ \t]*[\"']?([^\"'\n#]+)", env)
+          if sdk:
+              print("pubspec environment.sdk     :", sdk.group(1).strip())
+          if fl:
+              print("pubspec environment.flutter :", fl.group(1).strip())
+
+          if not ver and fl and re.fullmatch(r"\d+\.\d+\.\d+", fl.group(1).strip()):
+              ver, src = fl.group(1).strip(), "pubspec environment.flutter"
+              explicit = True
+
+          # 4. Versi Flutter saat project dibuat: `flutter create` menulis batas bawah Dart SDK
+          #    sesuai SDK yang dipakai (mis. sdk: ^3.8.1 -> Flutter 3.32). Itu base paling aman,
+          #    karena kode & package project terakhir terbukti jalan di era itu.
+          def lower_bound(c):
+              m = re.search(r"(?:\^|>=)\s*(\d+)\.(\d+)(?:\.(\d+))?", c)
+              if m:
+                  return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+              return None
+
+          derived = False
+          if not ver and sdk:
+              lo = lower_bound(sdk.group(1))
+              if lo and lo >= (3, 5, 0):
+                  for fv, dv in TABLE:
+                      if dv == (lo[0], lo[1]):
+                          ver = "%d.%d.x" % fv
+                          src = "batas bawah Dart SDK %s -> Flutter %d.%d (versi saat project dibuat)" % (sdk.group(1).strip(), fv[0], fv[1])
+                          derived = True
+
+          # 5. Batas atas Dart SDK (mis. <3.0.0 -> butuh Flutter lama)
+          if not ver and sdk:
+              up = upper_bound(sdk.group(1))
+              if up and up < (4, 0, 0):
+                  best = None
+                  for fv, dv in TABLE:
+                      if (dv[0], dv[1], 0) < up:
+                          best = fv
+                  if best and best != TABLE[-1][0]:
+                      ver = "%d.%d.x" % best
+                      src = "batas Dart SDK (%s)" % sdk.group(1).strip()
+
+          # Batas bawah: Flutter paling lama yang masih memenuhi batas bawah Dart SDK project
+          floor = "3.16"
+          if sdk:
+              lo = lower_bound(sdk.group(1))
+              if lo:
+                  for fv, dv in TABLE:
+                      if dv >= (lo[0], lo[1]):
+                          floor = "%d.%d" % fv
+                          break
+          if ver:
+              msg = "Flutter %s  [sumber: %s]" % (ver, src)
+          else:
+              msg = "Flutter stable terbaru  [sumber: tidak ada batas versi di project]"
+          print("BASE FLUTTER ->", msg)
+          print("::notice title=Base Flutter::" + msg)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("FLUTTER_VER=%s\n" % ver)
+              # Base hasil tebakan boleh diganti ke stable terbaru kalau dependency butuh SDK lebih baru
+              f.write("FLUTTER_FALLBACK_OK=%s\n" % ("1" if derived else "0"))
+              # Versi otomatis (bukan pilihan pengguna/FVM) boleh diganti ke yang lebih lama bila kode project tidak cocok
+              f.write("FLUTTER_AUTO_OK=%s\n" % ("0" if explicit else "1"))
+              f.write("FLUTTER_FLOOR=%s\n" % floor)
+          PY
+
+      - name: Setup - Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup - Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VER }}
+          cache: true
+
+      - name: Setup - flutter pub get
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          cd "$PROJECT_DIR"
+          flutter --version
+          flutter pub get 2>&1 | tee "$RUNNER_TEMP/pubget.log"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            if [ "${FLUTTER_FALLBACK_OK:-0}" = "1" ] && grep -qiE "requires SDK version|current Dart SDK version|current Flutter SDK version" "$RUNNER_TEMP/pubget.log"; then
+              echo "Dependency project butuh SDK lebih baru dari Flutter ${FLUTTER_VER} -> pindah ke Flutter stable terbaru"
+              echo "NEED_ALT=1" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "pub get gagal (versi package bentrok) -> upgrade major semua dependency"
+            if ! flutter pub upgrade --major-versions; then
+              echo "::error::Dependency tidak bisa diselesaikan. Cek pubspec.yaml project."
+              exit 1
+            fi
+          fi
+          exit 0
+
+      - name: Setup - Flutter stable terbaru (cadangan)
+        if: env.NEED_ALT == '1'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup - pub get (Flutter cadangan)
+        if: env.NEED_ALT == '1'
+        shell: bash
+        run: |
+          set -uo pipefail
+          cd "$PROJECT_DIR"
+          flutter --version
+          flutter pub get || flutter pub upgrade --major-versions
+
+      - name: Setup - patch Gradle, AGP, Kotlin
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/rsya_patch.py" <<'PY'
+          import json, os, re, subprocess, sys
+
+          ANDROID = os.path.join(os.environ["PROJECT_DIR"], "android")
+          STATE = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "rsya_mins.json")
+          FILES = ["settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"]
+          WRAP = os.path.join(ANDROID, "gradle", "wrapper", "gradle-wrapper.properties")
+
+          VER = r"(\d+\.\d+(?:\.\d+)?)"
+          AGP_RX = [
+              r"""(com\.android\.(?:application|library)["']\)?\s+version\s+["'])""" + VER + r"""(["'])""",
+              r"""(com\.android\.tools\.build:gradle:)""" + VER + r"""()""",
+          ]
+          KT_RX = [
+              r"""(org\.jetbrains\.kotlin\.android["']\)?\s+version\s+["'])""" + VER + r"""(["'])""",
+              r"""(kotlin-gradle-plugin:)""" + VER + r"""()""",
+              r"""(kotlin_version\s*=\s*["'])""" + VER + r"""(["'])""",
+          ]
+
+          # Gradle minimal yang dibutuhkan tiap versi AGP
+          AGP_GRADLE = {
+              (7, 0): (7, 0, 2), (7, 1): (7, 2, 0), (7, 2): (7, 3, 3), (7, 3): (7, 4, 0),
+              (7, 4): (7, 5, 0), (8, 0): (8, 0, 0), (8, 1): (8, 0, 0), (8, 2): (8, 2, 0),
+              (8, 3): (8, 4, 0), (8, 4): (8, 6, 0), (8, 5): (8, 7, 0), (8, 6): (8, 7, 0),
+              (8, 7): (8, 9, 0), (8, 8): (8, 10, 2), (8, 9): (8, 11, 1), (8, 10): (8, 11, 1),
+              (8, 11): (8, 13, 0), (8, 12): (8, 13, 0), (8, 13): (8, 13, 0),
+          }
+
+          def ver(s):
+              p = [int(x) for x in re.findall(r"\d+", s)[:3]]
+              while len(p) < 3:
+                  p.append(0)
+              return tuple(p)
+
+          def vs(t):
+              return ".".join(str(x) for x in t)
+
+          def gs(t):
+              return "%d.%d" % t[:2] if t[2] == 0 else vs(t)
+
+          def mx(*vals):
+              v = [tuple(x) for x in vals if x]
+              return max(v) if v else None
+
+          def need_gradle(agp):
+              if agp[0] >= 9:
+                  return (9, 1, 0)
+              r = AGP_GRADLE.get(agp[:2])
+              if r:
+                  return r
+              return (8, 13, 0) if agp[:2] > (8, 13) else (0, 0, 0)
+
+          def read(p):
+              try:
+                  with open(p, encoding="utf-8") as f:
+                      return f.read()
+              except OSError:
+                  return ""
+
+          def flutter_version():
+              try:
+                  out = subprocess.run(["flutter", "--version", "--machine"],
+                                       capture_output=True, text=True, timeout=180).stdout
+                  j = json.JSONDecoder().raw_decode(out[out.index("{"):])[0]
+                  return ver(j["frameworkVersion"])
+              except Exception:
+                  return (99, 0, 0)
+
+          def profile(fv):
+              if fv >= (3, 38, 0):
+                  return {"gradle": (8, 14, 0), "agp": (8, 11, 1), "kotlin": (2, 2, 20)}
+              if fv >= (3, 29, 0):
+                  return {"gradle": (8, 7, 0), "agp": (8, 1, 1), "kotlin": (1, 8, 22)}
+              return {"gradle": None, "agp": None, "kotlin": None}
+
+          def load():
+              try:
+                  with open(STATE) as f:
+                      return {k: tuple(v) for k, v in json.load(f).items()}
+              except Exception:
+                  return {}
+
+          def save(m):
+              with open(STATE, "w") as f:
+                  json.dump({k: list(v) for k, v in m.items()}, f)
+
+          def parse_log(path, mins):
+              text = read(path)
+              pat = re.compile(r"Your project's (.+?) version \(([^)]*)\) is lower than Flutter's minimum supported version of ([0-9][0-9.]*)")
+              found = False
+              for name, cur, need in pat.findall(text):
+                  n = name.lower()
+                  if "kotlin" in n or "kgp" in n:
+                      key = "kotlin"
+                  elif "android gradle" in n or "agp" in n:
+                      key = "agp"
+                  elif "gradle" in n:
+                      key = "gradle"
+                  else:
+                      continue
+                  nt = ver(need)
+                  if key not in mins or nt > mins[key]:
+                      mins[key] = nt
+                      found = True
+                      print("Flutter meminta minimal %s %s (project: %s)" % (key, vs(nt), cur))
+              return found
+
+          def find_cur(rxs):
+              for n in FILES:
+                  t = read(os.path.join(ANDROID, n))
+                  for rx in rxs:
+                      m = re.search(rx, t)
+                      if m:
+                          return ver(m.group(2))
+              return None
+
+          def rewrite(rxs, target):
+              ts = vs(target)
+              for n in FILES:
+                  p = os.path.join(ANDROID, n)
+                  old = read(p)
+                  if not old:
+                      continue
+                  new = old
+                  for rx in rxs:
+                      new = re.sub(rx, lambda m: m.group(1) + ts + m.group(3), new)
+                  if new != old:
+                      with open(p, "w", encoding="utf-8") as f:
+                          f.write(new)
+                      print("  diubah:", n)
+
+          mins = load()
+          if len(sys.argv) > 2 and sys.argv[1] == "--from-log":
+              if not parse_log(sys.argv[2], mins):
+                  sys.exit(1)
+              save(mins)
+
+          fv = flutter_version()
+          prof = profile(fv)
+          print("Flutter terpasang:", vs(fv))
+
+          agp_cur, kt_cur = find_cur(AGP_RX), find_cur(KT_RX)
+          m = re.search(r"gradle-" + VER + r"-", read(WRAP))
+          g_cur = ver(m.group(1)) if m else None
+
+          agp_min = mx(prof["agp"], mins.get("agp"))
+          if agp_cur is None:
+              agp_t = None
+          elif agp_cur[0] >= 9 and not (agp_min and agp_min[0] >= 9):
+              agp_t = mx((8, 11, 1), agp_min)
+          else:
+              agp_t = mx(agp_cur, agp_min)
+
+          g_min = mx(prof["gradle"], mins.get("gradle"), need_gradle(agp_t) if agp_t else None)
+          if g_cur is None:
+              g_t = g_min or (8, 14, 0)
+          elif g_cur[0] >= 9 and (agp_t is None or agp_t[0] < 9):
+              g_t = mx((8, 14, 0), g_min)
+          else:
+              g_t = mx(g_cur, g_min)
+
+          kt_t = None if kt_cur is None else mx(kt_cur, prof["kotlin"], mins.get("kotlin"))
+
+          print("Gradle : %s -> %s" % (vs(g_cur) if g_cur else "-", vs(g_t)))
+          print("AGP    : %s -> %s" % (vs(agp_cur) if agp_cur else "-", vs(agp_t) if agp_t else "-"))
+          print("Kotlin : %s -> %s" % (vs(kt_cur) if kt_cur else "-", vs(kt_t) if kt_t else "-"))
+
+          if agp_t and agp_t != agp_cur:
+              rewrite(AGP_RX, agp_t)
+          if kt_t and kt_t != kt_cur:
+              rewrite(KT_RX, kt_t)
+
+          url = "distributionUrl=https://services.gradle.org/distributions/gradle-%s-all.zip" % gs(g_t)
+          if g_t != g_cur:
+              if os.path.isfile(WRAP):
+                  t = read(WRAP)
+                  t2 = re.sub(r"(?m)^distributionUrl=.*$", lambda _: url, t)
+                  with open(WRAP, "w") as f:
+                      f.write(t2)
+              else:
+                  os.makedirs(os.path.dirname(WRAP), exist_ok=True)
+                  with open(WRAP, "w") as f:
+                      f.write("distributionBase=GRADLE_USER_HOME\ndistributionPath=wrapper/dists\n%s\nzipStoreBase=GRADLE_USER_HOME\nzipStorePath=wrapper/dists\n" % url)
+              print("  diubah: gradle-wrapper.properties")
+
+          props = os.path.join(ANDROID, "gradle.properties")
+          cur = read(props)
+          if cur and not cur.endswith("\n"):
+              cur += "\n"
+          for k, v in (("org.gradle.jvmargs", "-Xmx4G -XX:MaxMetaspaceSize=2G -XX:+HeapDumpOnOutOfMemoryError"),
+                       ("android.useAndroidX", "true"),
+             ("kotlin.jvm.target.validation.mode", "warning")):
+              if not re.search(r"(?m)^\s*%s\s*=" % re.escape(k), cur):
+                  cur += "%s=%s\n" % (k, v)
+          with open(props, "w") as f:
+              f.write(cur)
+          PY
+          python3 "$RUNNER_TEMP/rsya_patch.py"
+
+      - name: Setup - cek kompatibilitas package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set +e
+          set -uo pipefail
+          cd "$PROJECT_DIR"
+          cat > "$RUNNER_TEMP/rsya_plugins.py" <<'PY'
+          import json, os, re
+          from urllib.parse import unquote, urlparse
+
+          proj = os.path.abspath(os.environ["PROJECT_DIR"])
+          cfg = os.path.join(proj, ".dart_tool", "package_config.json")
+          try:
+              with open(cfg, encoding="utf-8") as f:
+                  pkgs = json.load(f)["packages"]
+          except Exception:
+              print("package_config.json belum ada, lewati")
+              raise SystemExit(0)
+
+          def read(p):
+              try:
+                  with open(p, encoding="utf-8", errors="replace") as f:
+                      return f.read()
+              except OSError:
+                  return ""
+
+          # AGP < 8 tidak butuh namespace
+          agp_major = 8
+          for n in ("settings.gradle", "settings.gradle.kts", "build.gradle", "build.gradle.kts"):
+              t = read(os.path.join(proj, "android", n))
+              m = re.search(r"""com\.android\.(?:application|library|tools\.build:gradle)["':)\s]*(?:version\s+["']|:)?(\d+)\.""", t)
+              if m:
+                  agp_major = int(m.group(1))
+                  break
+          if agp_major < 8:
+              print("AGP < 8, namespace plugin tidak perlu")
+              raise SystemExit(0)
+
+          fixed = 0
+          for p in pkgs:
+              uri = p.get("rootUri", "")
+              if uri.startswith("file://"):
+                  root = unquote(urlparse(uri).path)
+              else:
+                  root = os.path.normpath(os.path.join(os.path.dirname(cfg), unquote(uri)))
+              root = os.path.abspath(root)
+              if root.startswith(proj):
+                  continue
+              adir = os.path.join(root, "android")
+              for gname in ("build.gradle", "build.gradle.kts"):
+                  g = os.path.join(adir, gname)
+                  txt = read(g)
+                  if not txt or re.search(r"\bnamespace\b", txt):
+                      continue
+                  man = read(os.path.join(adir, "src", "main", "AndroidManifest.xml"))
+                  m = re.search(r"""package\s*=\s*["']([^"']+)["']""", man)
+                  if not m:
+                      continue
+                  am = re.search(r"(?m)^([ \t]*)android\s*\{", txt)
+                  if not am:
+                      continue
+                  line = ('namespace = "%s"' if gname.endswith(".kts") else 'namespace "%s"') % m.group(1)
+                  new = txt[:am.end()] + "\n" + am.group(1) + "    " + line + txt[am.end():]
+                  with open(g, "w", encoding="utf-8") as f:
+                      f.write(new)
+                  fixed += 1
+                  print("namespace ditambahkan:", p.get("name"), "->", m.group(1))
+          print("Plugin diperbaiki:", fixed)
+          PY
+          cat > "$RUNNER_TEMP/rsya_tools.py" <<'TOOLS'
+          import json, os, re, sys, urllib.request
+
+          PROJ = os.environ.get("PROJECT_DIR", ".")
+          TMP = os.environ.get("RUNNER_TEMP", "/tmp")
+          SKIP_PKGS = {"flutter", "flutter_test", "flutter_web_plugins", "flutter_driver", "sky_engine"}
+          LADDER = ["3.38", "3.35", "3.32", "3.29", "3.27", "3.24", "3.22", "3.19", "3.16"]
+
+          def read(p):
+              try:
+                  with open(p, encoding="utf-8", errors="replace") as f:
+                      return f.read()
+              except OSError:
+                  return ""
+
+          def vt(s):
+              m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", s.strip())
+              return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else None
+
+          def satisfies(v, c):
+              c = (c or "").strip().strip("\"'")
+              if not c or c == "any":
+                  return True
+              m = re.fullmatch(r"\^(\d+)\.(\d+)(?:\.(\d+))?", c)
+              if m:
+                  lo = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+                  if lo[0] > 0:
+                      up = (lo[0] + 1, 0, 0)
+                  elif lo[1] > 0:
+                      up = (0, lo[1] + 1, 0)
+                  else:
+                      up = (0, 0, lo[2] + 1)
+                  return lo <= v < up
+              ops = re.findall(r"(>=|<=|>|<)\s*(\d+\.\d+(?:\.\d+)?)", c)
+              if ops:
+                  for op, ver in ops:
+                      t = vt(ver)
+                      if (op == ">=" and not v >= t) or (op == "<=" and not v <= t) or \
+                         (op == ">" and not v > t) or (op == "<" and not v < t):
+                          return False
+                  return True
+              t = vt(c)
+              return v == t if t else True
+
+          # ---------- analyze: error di kode project -> file -> package penyebab ----------
+          def analyze(log):
+              files = {}
+              cur = None
+              for line in read(log).splitlines():
+                  m = re.match(r"^((?:lib|bin|test|integration_test)/[^\s:]+):\d+:\d+: Error:", line)
+                  if m:
+                      cur = m.group(1)
+                      files.setdefault(cur, {"errors": 0, "pkgs": []})["errors"] += 1
+                      continue
+                  if re.match(r"^\S[^\s]*:\d+:\d+: Error:", line):
+                      cur = None
+                      continue
+                  if cur:
+                      for pm in re.finditer(r"is from 'package:([a-z0-9_]+)/", line):
+                          p = pm.group(1)
+                          if p not in SKIP_PKGS and p not in files[cur]["pkgs"]:
+                              files[cur]["pkgs"].append(p)
+              return files
+
+          def project_name():
+              m = re.search(r"(?m)^name:\s*(\S+)", read(os.path.join(PROJ, "pubspec.yaml")))
+              return m.group(1) if m else ""
+
+          def direct_deps():
+              t = read(os.path.join(TMP, "pubspec.orig")) or read(os.path.join(PROJ, "pubspec.yaml"))
+              m = re.search(r"(?ms)^dependencies:[ \t]*\n(.*?)(?=^\S|\Z)", t)
+              return re.findall(r"(?m)^  ([a-z0-9_]+):", m.group(1)) if m else []
+
+          def culprits(log):
+              files = analyze(log)
+              pkgs = {}
+              for f, d in files.items():
+                  for p in d["pkgs"]:
+                      pkgs[p] = pkgs.get(p, 0) + d["errors"]
+              if pkgs:
+                  return [p for p, _ in sorted(pkgs.items(), key=lambda x: -x[1])], True
+              # tidak ada petunjuk 'is from' -> duga dari import di file yang error
+              deps = set(direct_deps()) - SKIP_PKGS
+              count = {}
+              for f in files:
+                  for p in re.findall(r"import\s+['\"]package:([a-z0-9_]+)/", read(os.path.join(PROJ, f))):
+                      if p in deps:
+                          count[p] = count.get(p, 0) + files[f]["errors"]
+              return [p for p, _ in sorted(count.items(), key=lambda x: -x[1])][:3], False
+
+          def report(log):
+              files = analyze(log)
+              if not files:
+                  return
+              print("== Laporan: file project yang error ==")
+              for f, d in sorted(files.items(), key=lambda x: -x[1]["errors"]):
+                  print("  %-38s %3d error  <- %s" % (f, d["errors"], ", ".join(d["pkgs"]) or "(tidak terdeteksi)"))
+              c, sure = culprits(log)
+              print("Package penyebab%s: %s" % ("" if sure else " (dugaan dari import)", ", ".join(c) or "-"))
+
+          # ---------- versi package ----------
+          def lock_version(pkg):
+              t = read(os.path.join(PROJ, "pubspec.lock"))
+              m = re.search(r"(?m)^  %s:\n(?:    .*\n)*?    version: \"([^\"]+)\"" % re.escape(pkg), t)
+              return vt(m.group(1)) if m else None
+
+          def orig_constraint(pkg):
+              t = read(os.path.join(TMP, "pubspec.orig"))
+              m = re.search(r"(?m)^  %s:[ \t]*[\"']?([^\"'\n#{]+)" % re.escape(pkg), t)
+              return m.group(1).strip() if m else None
+
+          def pub_versions(pkg):
+              d = os.environ.get("RSYA_PUB_JSON_DIR")
+              if d:
+                  data = json.loads(read(os.path.join(d, pkg + ".json")) or "{}")
+              else:
+                  with urllib.request.urlopen("https://pub.dev/api/packages/" + pkg, timeout=30) as r:
+                      data = json.loads(r.read().decode("utf-8"))
+              return data.get("versions", [])
+
+          def candidates(pkg, limit=5):
+              cur = lock_version(pkg)
+              con = orig_constraint(pkg)
+              dart = vt(os.environ.get("RSYA_DART", "")) or (99, 0, 0)
+              best = {}
+              for v in pub_versions(pkg):
+                  s = v.get("version", "")
+                  if not re.fullmatch(r"\d+\.\d+\.\d+", s) or v.get("retracted"):
+                      continue
+                  t = vt(s)
+                  if cur and not t < cur:
+                      continue
+                  if con and not satisfies(t, con):
+                      continue
+                  sdk = ((v.get("pubspec") or {}).get("environment") or {}).get("sdk", "")
+                  if sdk and not satisfies(dart, sdk):
+                      continue
+                  k = t[:2]
+                  if k not in best or t > best[k]:
+                      best[k] = t
+              out = sorted(best.values(), reverse=True)[:limit]
+              return [".".join(map(str, t)) for t in out]
+
+          def pin(pkg, ver):
+              p = os.path.join(PROJ, "pubspec.yaml")
+              t = read(p)
+              m = re.search(r"(?m)^dependency_overrides:[ \t]*\n", t)
+              line = "  %s: %s\n" % (pkg, ver)
+              if m:
+                  rest = t[m.end():]
+                  e = re.search(r"(?m)^\S", rest)
+                  body, tail = (rest[:e.start()], rest[e.start():]) if e else (rest, "")
+                  body = re.sub(r"(?m)^  %s:.*\n" % re.escape(pkg), "", body)
+                  t = t[:m.end()] + line + body + tail
+              else:
+                  if not t.endswith("\n"):
+                      t += "\n"
+                  t += "\ndependency_overrides:\n" + line
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(t)
+
+          def older_flutter(cur, floor):
+              c, fl = vt(cur + ".0")[:2], vt(floor + ".0")[:2]
+              for x in LADDER:
+                  t = vt(x + ".0")[:2]
+                  if t < c and t >= fl:
+                      return x
+              return ""
+
+          if __name__ == "__main__":
+              cmd, args = sys.argv[1], sys.argv[2:]
+              if cmd == "analyze":
+                  report(args[0])
+              elif cmd == "culprits":
+                  print("\n".join(culprits(args[0])[0]))
+              elif cmd == "candidates":
+                  print(" ".join(candidates(args[0])))
+              elif cmd == "pin":
+                  pin(args[0], args[1])
+              elif cmd == "older-flutter":
+                  print(older_flutter(args[0], args[1]))
+          TOOLS
+          cat > "$RUNNER_TEMP/rsya_lib.sh" <<'LIB'
+          RSYA_ALL="$RUNNER_TEMP/build_all.log"
+          RSYA_LIVE="$RUNNER_TEMP/live.txt"
+          RSYA_TRIED_FILE="$RUNNER_TEMP/rsya_tried.txt"
+          RSYA_ALLDONE_FILE="$RUNNER_TEMP/rsya_all_done"
+          touch "$RSYA_ALL" "$RSYA_TRIED_FILE"
+
+          # Kirim ekor log ke body release tiap 10 detik -> aplikasi menampilkannya secara live
+          rsya_publish() {
+            {
+              echo "RSYA-LIVE"
+              tail -c 80000 "$RSYA_ALL" 2>/dev/null \
+                | sed -E 's/\x1B\[[0-9;]*[A-Za-z]//g; s/\r/\n/g' \
+                | sed -E 's/^\[[= ]*\] +[0-9]+% //' \
+                | awk 'NF && $0 != p { print substr($0, 1, 250) } { p = $0 }' \
+                | tail -n 300
+            } > "$RSYA_LIVE"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$RSYA_LIVE" > /dev/null 2>&1 || true
+          }
+          rsya_live_start() {
+            ( n=0
+              while true; do
+                sleep 10; n=$((n + 1))
+                # Diagnosa tiap ±1 menit: disk/RAM habis adalah penyebab umum runner dimatikan GitHub
+                if [ $((n % 6)) -eq 0 ]; then
+                  echo "[sys] disk kosong $(df -BG --output=avail / | tail -1 | tr -d ' ') | RAM tersedia $(free -g | awk '/Mem:/{print $7}')G" | tee -a "$RSYA_ALL"
+                fi
+                rsya_publish
+              done ) &
+            RSYA_PUB_PID=$!
+            trap 'kill "$RSYA_PUB_PID" 2>/dev/null; rsya_publish' EXIT
+          }
+
+          # Nama package (pub.dev) yang gagal compile, diambil dari log
+          rsya_pkgs_from_log() {
+            grep -oE 'pub\.dev/[A-Za-z0-9_]+-[0-9][^/]*/[^ ]*: Error' "$1" \
+              | sed -E 's#^pub\.dev/([A-Za-z0-9_]+)-[0-9].*#\1#' | sort -u
+          }
+
+          # Ada error di kode project sendiri (lib/, test/, ...) -> bukan salah package
+          rsya_project_errors() {
+            grep -qE '^(lib|bin|test|integration_test)/[^ ]*: Error' "$1"
+          }
+
+          # Return 0 kalau upgrade package sebelumnya membuat kode project error (dibatalkan, pubspec dikembalikan)
+          rsya_guard() {
+            if [ -f "$RUNNER_TEMP/rsya_upgraded" ] && rsya_project_errors "$1"; then
+              echo "Upgrade package membuat kode project error (API berubah) -> dibatalkan, pubspec.yaml dikembalikan"
+              cp "$RUNNER_TEMP/pubspec.snap" pubspec.yaml
+              flutter pub get || true
+              rm -f "$RUNNER_TEMP/rsya_upgraded"
+              touch "$RSYA_ALLDONE_FILE"
+              return 0
+            fi
+            return 1
+          }
+
+          # Return 0 kalau ada package yang diupgrade (build/cek perlu diulang), 1 kalau tidak ada yang bisa dilakukan
+          rsya_fix_pkgs() {
+            local pkgs new="" p tried
+            pkgs=$(rsya_pkgs_from_log "$1")
+            [ -z "$pkgs" ] && return 1
+            tried=" $(tr '\n' ' ' < "$RSYA_TRIED_FILE") "
+            for p in $pkgs; do
+              case "$tried" in
+                *" $p "*) ;;
+                *) new="$new $p"; echo "$p" >> "$RSYA_TRIED_FILE" ;;
+              esac
+            done
+            if [ -n "$new" ]; then
+              echo "Package tidak cocok dengan Flutter ini:$new -> upgrade major"
+              cp pubspec.yaml "$RUNNER_TEMP/pubspec.snap"; touch "$RUNNER_TEMP/rsya_upgraded"
+              flutter pub upgrade --major-versions $new || flutter pub upgrade $new || true
+              python3 "$RUNNER_TEMP/rsya_plugins.py" || true
+              return 0
+            fi
+            if [ ! -f "$RSYA_ALLDONE_FILE" ]; then
+              touch "$RSYA_ALLDONE_FILE"
+              echo "Masih ada package bermasalah -> upgrade major semua dependency"
+              cp pubspec.yaml "$RUNNER_TEMP/pubspec.snap"; touch "$RSYA_ALLDONE_FILE" "$RUNNER_TEMP/rsya_upgraded"
+              flutter pub upgrade --major-versions || true
+              python3 "$RUNNER_TEMP/rsya_plugins.py" || true
+              return 0
+            fi
+            return 1
+          }
+
+          rsya_tools() { python3 "$RUNNER_TEMP/rsya_tools.py" "$@"; }
+
+          # Compile Dart saja (tanpa Gradle); log di $RUNNER_TEMP/deps.log
+          rsya_compile() {
+            timeout 900 flutter build bundle --debug 2>&1 | tee -a "$RSYA_ALL" | tee "$RUNNER_TEMP/deps.log"
+            return "${PIPESTATUS[0]}"
+          }
+
+          # Cari versi package (dalam batas constraint asli pubspec) yang didukung kode project.
+          # Return 0 kalau ketemu dan sudah terpasang.
+          rsya_pin_search() {
+            local pkg="$1" cands v rc
+            export RSYA_DART=$(dart --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            cands=$(rsya_tools candidates "$pkg" 2>/dev/null)
+            if [ -z "$cands" ]; then
+              echo "Tidak ada versi alternatif untuk $pkg"
+              return 1
+            fi
+            echo "Mencari versi $pkg yang didukung kode project. Kandidat: $cands"
+            cp pubspec.yaml "$RUNNER_TEMP/pubspec.pinbase"
+            for v in $cands; do
+              echo "== Coba $pkg $v =="
+              rsya_tools pin "$pkg" "$v"
+              if ! flutter pub get > /dev/null 2>&1; then
+                echo "  pub get gagal untuk $v, lewati"
+                cp "$RUNNER_TEMP/pubspec.pinbase" pubspec.yaml
+                continue
+              fi
+              rsya_compile
+              rc=$?
+              if [ "$rc" -eq 0 ] || { ! rsya_tools culprits "$RUNNER_TEMP/deps.log" | grep -qx "$pkg" && ! rsya_pkgs_from_log "$RUNNER_TEMP/deps.log" | grep -qx "$pkg"; }; then
+                echo "Package $pkg dipasang di versi $v (didukung kode project)"
+                return 0
+              fi
+              cp "$RUNNER_TEMP/pubspec.pinbase" pubspec.yaml
+            done
+            flutter pub get > /dev/null 2>&1 || true
+            echo "Tidak ada versi $pkg yang cocok dengan kode project"
+            return 1
+          }
+
+          # Pindah ke Flutter stable yang lebih lama (tidak lebih lama dari base project). Return 0 kalau berhasil pindah.
+          rsya_flutter_older() {
+            [ "${FLUTTER_AUTO_OK:-0}" = "1" ] || return 1
+            local cur next tag dir
+            cur=$(flutter --version --machine 2>/dev/null | python3 -c "import json,sys; t=sys.stdin.read(); j=json.JSONDecoder().raw_decode(t[t.index('{'):])[0]; print('.'.join(j['frameworkVersion'].split('.')[:2]))")
+            next=$(rsya_tools older-flutter "$cur" "${FLUTTER_FLOOR:-3.16}")
+            if [ -z "$next" ]; then
+              echo "Tidak ada Flutter yang lebih lama dari $cur yang masih didukung project"
+              return 1
+            fi
+            tag=$(git ls-remote --tags https://github.com/flutter/flutter.git "refs/tags/${next}.*" 2>/dev/null | grep -E "refs/tags/${next}\.[0-9]+$" | sed 's#.*refs/tags/##' | sort -V | tail -1)
+            [ -z "$tag" ] && return 1
+            dir="$RUNNER_TEMP/flutter_$tag"
+            echo "Kode project tidak cocok dengan Flutter $cur -> pindah ke Flutter $tag"
+            git clone --depth 1 --branch "$tag" https://github.com/flutter/flutter.git "$dir" > /dev/null 2>&1 || return 1
+            export PATH="$dir/bin:$PATH" FLUTTER_ROOT="$dir"
+            echo "$dir/bin" >> "$GITHUB_PATH"
+            echo "FLUTTER_ROOT=$dir" >> "$GITHUB_ENV"
+            flutter --version
+            cp "$RUNNER_TEMP/pubspec.orig" pubspec.yaml
+            rm -f pubspec.lock
+            flutter pub get || return 1
+            python3 "$RUNNER_TEMP/rsya_patch.py" || true
+            rm -f "$RSYA_TRIED_FILE" "$RSYA_ALLDONE_FILE" "$RUNNER_TEMP/rsya_upgraded" "$RUNNER_TEMP/rsya_pinned"
+            touch "$RSYA_TRIED_FILE"
+            return 0
+          }
+
+          rsya_free_disk() {
+            echo "Disk sebelum dibersihkan:"; df -h / | tail -1
+            # Hapus toolchain bawaan runner yang tidak dipakai Flutter/Android (±25-30 GB)
+            for d in /usr/share/dotnet /usr/local/share/boost /opt/ghc /usr/local/.ghcup /usr/share/swift \
+                     /opt/hostedtoolcache/CodeQL /usr/local/julia* /usr/share/miniconda /opt/microsoft \
+                     /usr/local/share/powershell /usr/local/share/chromium /opt/az /usr/lib/google-cloud-sdk \
+                     /usr/lib/mono /usr/local/lib/heroku /usr/share/kotlinc; do
+              sudo rm -rf $d &
+            done
+            sudo docker system prune -af > /dev/null 2>&1 &
+            sudo apt-get clean > /dev/null 2>&1 &
+            wait
+            echo "Disk setelah dibersihkan:"; df -h / | tail -1
+          }
+          LIB
+          source "$RUNNER_TEMP/rsya_lib.sh"
+          rsya_live_start
+          cp pubspec.yaml "$RUNNER_TEMP/pubspec.orig"
+
+          # Perbaiki plugin lama yang belum punya namespace (wajib di AGP 8+)
+          python3 "$RUNNER_TEMP/rsya_plugins.py" || true
+
+          # Resolver: compile Dart (tanpa Gradle), lalu cari kombinasi versi yang didukung kode project
+          final_rc=0
+          GUARDED=0
+          for round in 1 2 3 4 5 6 7 8; do
+            echo "== Cek kompatibilitas package (putaran $round) =="
+            rsya_compile
+            final_rc=$?
+            if [ "$final_rc" -eq 0 ]; then
+              echo "Semua package dan kode project kompatibel dengan Flutter ini"
+              break
+            fi
+            rsya_tools analyze "$RUNNER_TEMP/deps.log"
+
+            if rsya_project_errors "$RUNNER_TEMP/deps.log"; then
+              # 1) Upgrade major yang barusan dilakukan merusak kode project -> batalkan
+              if rsya_guard "$RUNNER_TEMP/deps.log"; then
+                if rsya_flutter_older; then continue; fi
+                GUARDED=1
+                break
+              fi
+              # 2) Kode project error karena API package -> cari versi package yang didukung
+              moved=0
+              for p in $(rsya_tools culprits "$RUNNER_TEMP/deps.log"); do
+                if grep -qx "$p" "$RUNNER_TEMP/rsya_pinned" 2>/dev/null; then continue; fi
+                echo "$p" >> "$RUNNER_TEMP/rsya_pinned"
+                if rsya_pin_search "$p"; then moved=1; break; fi
+              done
+              if [ "$moved" -eq 1 ]; then continue; fi
+              # 3) Tidak ada versi package yang cocok -> coba Flutter yang lebih lama
+              if rsya_flutter_older; then continue; fi
+              break
+            fi
+
+            # Error hanya di dalam package pub
+            if rsya_fix_pkgs "$RUNNER_TEMP/deps.log"; then continue; fi
+            if rsya_flutter_older; then continue; fi
+            echo "Tidak ada masalah yang bisa diperbaiki otomatis, lanjut ke build"
+            break
+          done
+
+          # Masih ada package yang gagal compile -> build pasti gagal, hentikan lebih awal dengan pesan jelas
+          BAD=$(rsya_pkgs_from_log "$RUNNER_TEMP/deps.log" | tr '\n' ' ')
+          if [ "$GUARDED" -eq 1 ]; then
+            BAD=$(tr '\n' ' ' < "$RSYA_TRIED_FILE")
+          fi
+          if [ "$final_rc" -ne 0 ] && [ -n "$BAD" ]; then
+            echo "DEPS_UNRESOLVED=$BAD" >> "$GITHUB_ENV"
+            echo "::warning::Package belum kompatibel dengan Flutter ini: $BAD"
+          fi
+
+          echo "== Perubahan pubspec.yaml =="
+          diff -u "$RUNNER_TEMP/pubspec.orig" pubspec.yaml || true
+          exit 0
+
+      - name: Build - flutter build apk
+        shell: bash
+        env:
+          SPLIT: ${{ inputs.split_abi }}
+        run: |
+          # GitHub menjalankan bash dengan -e; matikan agar kegagalan build bisa ditangani loop retry
+          set +e
+          set -uo pipefail
+          cd "$PROJECT_DIR"
+          LOG="$GITHUB_WORKSPACE/build.log"
+          source "$RUNNER_TEMP/rsya_lib.sh"
+          rsya_live_start
+
+          if [ -n "${DEPS_UNRESOLVED:-}" ]; then
+            echo "::error::Package tidak kompatibel dengan $(flutter --version | head -1): ${DEPS_UNRESOLVED}"
+            echo "Solusi: isi 'Versi Flutter' di Pengaturan Build dengan versi lebih lama (mis. 3.32.x), atau perbarui package & kode project."
+            exit 1
+          fi
+
+          # Project sudah membatasi ABI lewat ndk abiFilters -> split per ABI pasti bentrok, matikan dari awal
+          if [ "$SPLIT" = "true" ] && grep -rqE "abiFilters" "$PROJECT_DIR"/android/app/build.gradle* 2>/dev/null; then
+            echo "Project memakai ndk abiFilters -> split per ABI dimatikan (build 1 APK arm + arm64)"
+            SPLIT="false"
+          fi
+
+          EXTRA=""
+          attempt=1
+          TRIED=" "
+          while true; do
+            echo "== Build percobaan $attempt =="
+            if [ "$SPLIT" = "true" ]; then
+              flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 $EXTRA 2>&1 | tee -a "$RSYA_ALL" | tee "$LOG"
+            else
+              flutter build apk --release $EXTRA 2>&1 | tee -a "$RSYA_ALL" | tee "$LOG"
+            fi
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -eq 0 ]; then break; fi
+            if [ "$attempt" -ge 6 ]; then
+              echo "::error::Build gagal setelah $attempt percobaan"
+              exit "$rc"
+            fi
+
+            # 0. Disk runner penuh -> bersihkan lalu ulangi sekali
+            if grep -q "No space left on device" "$LOG" && [ ! -f "$RUNNER_TEMP/rsya_disk_done" ]; then
+              touch "$RUNNER_TEMP/rsya_disk_done"
+              echo "Disk runner penuh -> membersihkan ruang lalu mengulang build"
+              rsya_free_disk
+              rm -rf "$HOME/.gradle/daemon" "$PROJECT_DIR/build/app/intermediates" 2>/dev/null
+              attempt=$((attempt + 1))
+              continue
+            fi
+
+            # 1. Project punya ndk abiFilters -> bentrok dengan --split-per-abi. Ulangi tanpa split.
+            if [ "$SPLIT" = "true" ] && grep -q "abiFilters cannot be present when splits abi filters are set" "$LOG"; then
+              echo "Project memakai ndk abiFilters, split per ABI dimatikan -> build 1 APK (arm + arm64)"
+              SPLIT="false"
+              attempt=$((attempt + 1))
+              continue
+            fi
+
+            # 2. Naikkan Gradle/AGP/Kotlin sesuai minimum yang diminta Flutter
+            if python3 "$RUNNER_TEMP/rsya_patch.py" --from-log "$LOG"; then
+              attempt=$((attempt + 1))
+              if [ "$attempt" -ge 5 ]; then EXTRA="--android-skip-build-dependency-validation"; fi
+              echo "Versi build tools disesuaikan, mengulang build..."
+              continue
+            fi
+
+            # 3. Plugin lama tanpa namespace (AGP 8+) -> tambahkan namespace lalu ulangi
+            if grep -q "Namespace not specified" "$LOG" && [ ! -f "$RUNNER_TEMP/rsya_ns_done" ]; then
+              touch "$RUNNER_TEMP/rsya_ns_done"
+              echo "Plugin tanpa namespace terdeteksi, memperbaiki..."
+              python3 "$RUNNER_TEMP/rsya_plugins.py" || true
+              attempt=$((attempt + 1))
+              continue
+            fi
+
+            # 4. Package pub gagal compile di Flutter ini -> upgrade package tsb
+            if rsya_guard "$LOG"; then
+              echo "::error::Upgrade package merusak kode project. Gunakan Flutter yang lebih lama (isi 'Versi Flutter' di Pengaturan Build)."
+              exit "$rc"
+            fi
+            if rsya_fix_pkgs "$LOG"; then
+              attempt=$((attempt + 1))
+              continue
+            fi
+
+            echo "::error::Build gagal (bukan masalah versi build tools atau package)"
+            exit "$rc"
+          done
+
+      - name: Publish - upload APK ke release
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$PROJECT_DIR/build/app/outputs/flutter-apk"
+          ls -lh "$OUT"
+          shopt -s nullglob
+          FILES=("$OUT"/*.apk)
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "::error::APK tidak ditemukan setelah build"
+            exit 1
+          fi
+          gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+
