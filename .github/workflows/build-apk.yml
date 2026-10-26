@@ -1196,8 +1196,15 @@ jobs:
             exit 1
           fi
           gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          # ZIP project tidak diperlukan lagi setelah build sukses (penting terutama untuk repo public)
+
+      - name: Selesai - hapus ZIP project dari release
+        if: always()
+        shell: bash
+        run: |
+          # Dijalankan setelah build selesai atau error. Kalau runner dimatikan paksa step ini
+          # tidak jalan, sehingga ZIP tetap ada untuk run ulang otomatis.
           gh release delete-asset "$TAG" project.zip --repo "$GITHUB_REPOSITORY" --yes || true
+          echo "project.zip dihapus dari release"
 
       - name: Setup - simpan cache Gradle
         if: always() && steps.cache.outputs.cache-hit != 'true'
