@@ -17,6 +17,21 @@ on:
         required: false
         default: 'true'
         type: string
+      build_mode:
+        description: Mode build (release/debug)
+        required: false
+        default: 'release'
+        type: string
+      abi:
+        description: Target CPU (all = arm+arm64, arm64 = arm64 saja)
+        required: false
+        default: 'all'
+        type: string
+      precheck:
+        description: Cek kompatibilitas package sebelum build (true/false)
+        required: false
+        default: 'false'
+        type: string
 
 permissions:
   contents: write
@@ -34,17 +49,40 @@ jobs:
         shell: bash
         run: |
           echo "Disk sebelum dibersihkan:"; df -h / | tail -1
-          # Hapus toolchain bawaan runner yang tidak dipakai Flutter/Android (±25-30 GB)
-          for d in /usr/share/dotnet /usr/local/share/boost /opt/ghc /usr/local/.ghcup /usr/share/swift \
-                   /opt/hostedtoolcache/CodeQL /usr/local/julia* /usr/share/miniconda /opt/microsoft \
-                   /usr/local/share/powershell /usr/local/share/chromium /opt/az /usr/lib/google-cloud-sdk \
-                   /usr/lib/mono /usr/local/lib/heroku /usr/share/kotlinc; do
-            sudo rm -rf $d &
+          # Dibersihkan di latar belakang supaya langkah berikutnya tidak menunggu
+          setsid nohup bash -c '
+            for d in /usr/share/dotnet /usr/local/share/boost /opt/ghc /usr/local/.ghcup /usr/share/swift \
+                     /opt/hostedtoolcache/CodeQL /usr/local/julia* /usr/share/miniconda /opt/microsoft \
+                     /usr/local/share/powershell /usr/local/share/chromium /opt/az /usr/lib/google-cloud-sdk \
+                     /usr/lib/mono /usr/local/lib/heroku /usr/share/kotlinc; do
+              sudo rm -rf $d
+            done
+            sudo docker system prune -af
+            sudo apt-get clean
+          ' > /dev/null 2>&1 &
+          echo "Pembersihan disk berjalan di latar belakang"
+
+      - name: Setup - swap & hemat RAM
+        shell: bash
+        run: |
+          set +e
+          echo "Memori sebelum:"; free -m | sed -n 1,3p
+          # Matikan layanan bawaan runner yang memakan RAM
+          for s in docker containerd snapd mysql postgresql apache2 nginx; do
+            sudo systemctl stop "$s" > /dev/null 2>&1
           done
-          sudo docker system prune -af > /dev/null 2>&1 &
-          sudo apt-get clean > /dev/null 2>&1 &
-          wait
-          echo "Disk setelah dibersihkan:"; df -h / | tail -1
+          # Swap besar di /mnt (disk sementara) agar Gradle/Dart tidak di-OOM-kill pada runner 7 GB
+          sudo swapoff -a > /dev/null 2>&1
+          sudo rm -f /mnt/swapfile
+          AVAIL=$(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9')
+          SZ=$(( ${AVAIL:-0} > 3 ? ${AVAIL:-0} - 2 : 0 ))
+          if [ "$SZ" -gt 12 ]; then SZ=12; fi
+          if [ "$SZ" -ge 2 ]; then
+            sudo fallocate -l "${SZ}G" /mnt/rsya_swap && sudo chmod 600 /mnt/rsya_swap && sudo mkswap /mnt/rsya_swap > /dev/null && sudo swapon /mnt/rsya_swap
+          fi
+          sudo sysctl -w vm.swappiness=80 vm.overcommit_memory=1 > /dev/null 2>&1
+          echo "Memori sesudah:"; free -m | sed -n 1,3p
+          exit 0
 
       - name: Setup - unduh dan ekstrak ZIP
         shell: bash
@@ -63,6 +101,17 @@ jobs:
           echo "Project ditemukan di: $DIR"
           rm -rf "$DIR/build" "$DIR/.dart_tool" "$DIR/android/.gradle"
           echo "PROJECT_DIR=$DIR" >> "$GITHUB_ENV"
+
+      - name: Setup - cache Gradle
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: rsya-gradle-${{ runner.os }}-${{ hashFiles('project_raw/pubspec.yaml', 'project_raw/android/**/*.gradle*', 'project_raw/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            rsya-gradle-${{ runner.os }}-
 
       - name: Setup - deteksi base Flutter
         shell: bash
@@ -467,9 +516,46 @@ jobs:
           cur = read(props)
           if cur and not cur.endswith("\n"):
               cur += "\n"
-          for k, v in (("org.gradle.jvmargs", "-Xmx4G -XX:MaxMetaspaceSize=2G -XX:+HeapDumpOnOutOfMemoryError"),
-                       ("android.useAndroidX", "true"),
-             ("kotlin.jvm.target.validation.mode", "warning")):
+          def mem_gb():
+              try:
+                  with open("/proc/meminfo") as f:
+                      for l in f:
+                          if l.startswith("MemTotal"):
+                              return int(l.split()[1]) / 1048576.0
+              except Exception:
+                  pass
+              return 16.0
+
+          level = int(os.environ.get("RSYA_MEM_LEVEL", "0") or 0)
+          if int(os.environ.get("GITHUB_RUN_ATTEMPT", "1") or 1) > 1:
+              level = max(level, 2)
+          gb = mem_gb()
+          big = gb >= 10 and level < 2
+          if level >= 2:
+              heap, meta, workers = "2g", "512m", "1"
+          elif gb < 10:
+              heap, meta, workers = "3g", "768m", "2"
+          else:
+              heap, meta, workers = "4g", "1g", "4"
+          print("RAM runner %.1f GB -> Gradle heap %s, workers %s (level %d)" % (gb, heap, workers, level))
+
+          forced = [
+              ("org.gradle.jvmargs", "-Xmx%s -XX:MaxMetaspaceSize=%s -XX:ReservedCodeCacheSize=256m%s" % (heap, meta, "" if big else " -XX:+UseSerialGC")),
+              ("kotlin.compiler.execution.strategy", "in-process"),
+              ("org.gradle.workers.max", workers),
+              ("org.gradle.parallel", "true" if big else "false"),
+              ("org.gradle.caching", "true"),
+              ("org.gradle.daemon", "false"),
+              ("org.gradle.vfs.watch", "false"),
+          ]
+          soft = [("android.useAndroidX", "true"), ("kotlin.jvm.target.validation.mode", "warning")]
+          for k, v in forced:
+              rx = r"(?m)^\s*%s\s*=.*$" % re.escape(k)
+              if re.search(rx, cur):
+                  cur = re.sub(rx, lambda _m, k=k, v=v: "%s=%s" % (k, v), cur)
+              else:
+                  cur += "%s=%s\n" % (k, v)
+          for k, v in soft:
               if not re.search(r"(?m)^\s*%s\s*=" % re.escape(k), cur):
                   cur += "%s=%s\n" % (k, v)
           with open(props, "w") as f:
@@ -477,11 +563,8 @@ jobs:
           PY
           python3 "$RUNNER_TEMP/rsya_patch.py"
 
-      - name: Setup - cek kompatibilitas package
+      - name: Setup - alat perbaikan
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
         run: |
           set +e
           set -uo pipefail
@@ -756,7 +839,7 @@ jobs:
                 sleep 10; n=$((n + 1))
                 # Diagnosa tiap ±1 menit: disk/RAM habis adalah penyebab umum runner dimatikan GitHub
                 if [ $((n % 6)) -eq 0 ]; then
-                  echo "[sys] disk kosong $(df -BG --output=avail / | tail -1 | tr -d ' ') | RAM tersedia $(free -g | awk '/Mem:/{print $7}')G" | tee -a "$RSYA_ALL"
+                  echo "[sys] disk kosong $(df -BG --output=avail / | tail -1 | tr -d ' ') | $(free -m | awk '/Mem:/{printf "RAM tersedia %sM", $7} /Swap:/{printf " | swap terpakai %sM", $3}')" | tee -a "$RSYA_ALL"
                 fi
                 rsya_publish
               done ) &
@@ -901,64 +984,74 @@ jobs:
             wait
             echo "Disk setelah dibersihkan:"; df -h / | tail -1
           }
-          LIB
-          source "$RUNNER_TEMP/rsya_lib.sh"
-          rsya_live_start
-          cp pubspec.yaml "$RUNNER_TEMP/pubspec.orig"
 
-          # Perbaiki plugin lama yang belum punya namespace (wajib di AGP 8+)
-          python3 "$RUNNER_TEMP/rsya_plugins.py" || true
-
-          # Resolver: compile Dart (tanpa Gradle), lalu cari kombinasi versi yang didukung kode project
-          final_rc=0
-          GUARDED=0
-          for round in 1 2 3 4 5 6 7 8; do
-            echo "== Cek kompatibilitas package (putaran $round) =="
-            rsya_compile
-            final_rc=$?
-            if [ "$final_rc" -eq 0 ]; then
-              echo "Semua package dan kode project kompatibel dengan Flutter ini"
-              break
-            fi
-            rsya_tools analyze "$RUNNER_TEMP/deps.log"
-
-            if rsya_project_errors "$RUNNER_TEMP/deps.log"; then
-              # 1) Upgrade major yang barusan dilakukan merusak kode project -> batalkan
-              if rsya_guard "$RUNNER_TEMP/deps.log"; then
-                if rsya_flutter_older; then continue; fi
-                GUARDED=1
+          # Resolver: compile Dart (tanpa Gradle), lalu cari kombinasi versi package/Flutter yang didukung kode project.
+          # Hasil: RSYA_UNRESOLVED berisi nama package yang masih bermasalah (kosong = aman).
+          rsya_resolve() {
+            local final_rc=0 guarded=0 round moved p bad
+            RSYA_UNRESOLVED=""
+            for round in 1 2 3 4 5 6 7 8; do
+              echo "== Cek kompatibilitas package (putaran $round) =="
+              rsya_compile
+              final_rc=$?
+              if [ "$final_rc" -eq 0 ]; then
+                echo "Semua package dan kode project kompatibel dengan Flutter ini"
                 break
               fi
-              # 2) Kode project error karena API package -> cari versi package yang didukung
-              moved=0
-              for p in $(rsya_tools culprits "$RUNNER_TEMP/deps.log"); do
-                if grep -qx "$p" "$RUNNER_TEMP/rsya_pinned" 2>/dev/null; then continue; fi
-                echo "$p" >> "$RUNNER_TEMP/rsya_pinned"
-                if rsya_pin_search "$p"; then moved=1; break; fi
-              done
-              if [ "$moved" -eq 1 ]; then continue; fi
-              # 3) Tidak ada versi package yang cocok -> coba Flutter yang lebih lama
+              rsya_tools analyze "$RUNNER_TEMP/deps.log"
+
+              if rsya_project_errors "$RUNNER_TEMP/deps.log"; then
+                # 1) Upgrade major yang barusan dilakukan merusak kode project -> batalkan
+                if rsya_guard "$RUNNER_TEMP/deps.log"; then
+                  if rsya_flutter_older; then continue; fi
+                  guarded=1
+                  break
+                fi
+                # 2) Kode project error karena API package -> cari versi package yang didukung
+                moved=0
+                for p in $(rsya_tools culprits "$RUNNER_TEMP/deps.log"); do
+                  if grep -qx "$p" "$RUNNER_TEMP/rsya_pinned" 2>/dev/null; then continue; fi
+                  echo "$p" >> "$RUNNER_TEMP/rsya_pinned"
+                  if rsya_pin_search "$p"; then moved=1; break; fi
+                done
+                if [ "$moved" -eq 1 ]; then continue; fi
+                # 3) Tidak ada versi package yang cocok -> coba Flutter yang lebih lama
+                if rsya_flutter_older; then continue; fi
+                break
+              fi
+
+              # Error hanya di dalam package pub
+              if rsya_fix_pkgs "$RUNNER_TEMP/deps.log"; then continue; fi
               if rsya_flutter_older; then continue; fi
+              echo "Tidak ada masalah yang bisa diperbaiki otomatis"
               break
-            fi
+            done
 
-            # Error hanya di dalam package pub
-            if rsya_fix_pkgs "$RUNNER_TEMP/deps.log"; then continue; fi
-            if rsya_flutter_older; then continue; fi
-            echo "Tidak ada masalah yang bisa diperbaiki otomatis, lanjut ke build"
-            break
-          done
+            bad=$(rsya_pkgs_from_log "$RUNNER_TEMP/deps.log" | tr '\n' ' ')
+            if [ "$guarded" -eq 1 ]; then bad=$(tr '\n' ' ' < "$RSYA_TRIED_FILE"); fi
+            if [ "$final_rc" -ne 0 ] && [ -n "$bad" ]; then RSYA_UNRESOLVED="$bad"; fi
+            return 0
+          }
+          LIB
+          cp pubspec.yaml "$RUNNER_TEMP/pubspec.orig"
+          # Perbaiki plugin lama yang belum punya namespace (wajib di AGP 8+)
+          python3 "$RUNNER_TEMP/rsya_plugins.py" || true
+          exit 0
 
-          # Masih ada package yang gagal compile -> build pasti gagal, hentikan lebih awal dengan pesan jelas
-          BAD=$(rsya_pkgs_from_log "$RUNNER_TEMP/deps.log" | tr '\n' ' ')
-          if [ "$GUARDED" -eq 1 ]; then
-            BAD=$(tr '\n' ' ' < "$RSYA_TRIED_FILE")
+      - name: Setup - cek kompatibilitas package
+        if: inputs.precheck == 'true'
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          cd "$PROJECT_DIR"
+          source "$RUNNER_TEMP/rsya_lib.sh"
+          rsya_live_start
+          rsya_resolve
+          if [ -n "$RSYA_UNRESOLVED" ]; then
+            echo "DEPS_UNRESOLVED=$RSYA_UNRESOLVED" >> "$GITHUB_ENV"
+            echo "::warning::Package belum kompatibel dengan Flutter ini: $RSYA_UNRESOLVED"
           fi
-          if [ "$final_rc" -ne 0 ] && [ -n "$BAD" ]; then
-            echo "DEPS_UNRESOLVED=$BAD" >> "$GITHUB_ENV"
-            echo "::warning::Package belum kompatibel dengan Flutter ini: $BAD"
-          fi
-
           echo "== Perubahan pubspec.yaml =="
           diff -u "$RUNNER_TEMP/pubspec.orig" pubspec.yaml || true
           exit 0
@@ -967,6 +1060,8 @@ jobs:
         shell: bash
         env:
           SPLIT: ${{ inputs.split_abi }}
+          BUILD_MODE: ${{ inputs.build_mode }}
+          ABI: ${{ inputs.abi }}
         run: |
           # GitHub menjalankan bash dengan -e; matikan agar kegagalan build bisa ditangani loop retry
           set +e
@@ -982,19 +1077,38 @@ jobs:
             exit 1
           fi
 
+          MODE="${BUILD_MODE:-release}"
+          ARM64ONLY=0
+          if [ "${ABI:-all}" = "arm64" ]; then ARM64ONLY=1; fi
+          echo "Mode build: $MODE | target CPU: $([ "$ARM64ONLY" -eq 1 ] && echo arm64 || echo 'arm + arm64')"
+
           # Project sudah membatasi ABI lewat ndk abiFilters -> split per ABI pasti bentrok, matikan dari awal
-          if [ "$SPLIT" = "true" ] && grep -rqE "abiFilters" "$PROJECT_DIR"/android/app/build.gradle* 2>/dev/null; then
-            echo "Project memakai ndk abiFilters -> split per ABI dimatikan (build 1 APK arm + arm64)"
+          if [ "$MODE" = "release" ] && [ "$SPLIT" = "true" ] && grep -rqE "abiFilters" "$PROJECT_DIR"/android/app/build.gradle* 2>/dev/null; then
+            echo "Project memakai ndk abiFilters -> split per ABI dimatikan"
             SPLIT="false"
+          fi
+
+          # Mode hemat RAM: dipakai kalau run diulang setelah runner dimatikan (RAM habis) atau terjadi OutOfMemory
+          LOWMEM=0
+          if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
+            LOWMEM=1
+            ARM64ONLY=1
+            export RSYA_MEM_LEVEL=2
+            echo "Run diulang setelah runner dimatikan -> mode hemat RAM (heap kecil, 1 worker, hanya arm64)"
+            python3 "$RUNNER_TEMP/rsya_patch.py" || true
           fi
 
           EXTRA=""
           attempt=1
-          TRIED=" "
           while true; do
             echo "== Build percobaan $attempt =="
-            if [ "$SPLIT" = "true" ]; then
-              flutter build apk --release --split-per-abi --target-platform android-arm,android-arm64 $EXTRA 2>&1 | tee -a "$RSYA_ALL" | tee "$LOG"
+            if [ "$MODE" = "debug" ]; then
+              flutter build apk --debug $EXTRA 2>&1 | tee -a "$RSYA_ALL" | tee "$LOG"
+            elif [ "$SPLIT" = "true" ]; then
+              if [ "$ARM64ONLY" -eq 1 ]; then PLAT="android-arm64"; else PLAT="android-arm,android-arm64"; fi
+              flutter build apk --release --split-per-abi --target-platform "$PLAT" $EXTRA 2>&1 | tee -a "$RSYA_ALL" | tee "$LOG"
+            elif [ "$ARM64ONLY" -eq 1 ]; then
+              flutter build apk --release --target-platform android-arm64 $EXTRA 2>&1 | tee -a "$RSYA_ALL" | tee "$LOG"
             else
               flutter build apk --release $EXTRA 2>&1 | tee -a "$RSYA_ALL" | tee "$LOG"
             fi
@@ -1003,6 +1117,17 @@ jobs:
             if [ "$attempt" -ge 6 ]; then
               echo "::error::Build gagal setelah $attempt percobaan"
               exit "$rc"
+            fi
+
+            # 0a. Kehabisan memori -> mode hemat RAM lalu ulangi
+            if grep -qE "OutOfMemoryError|Java heap space|GC overhead limit exceeded|Metaspace|Killed|signal 9" "$LOG" && [ "$LOWMEM" -eq 0 ]; then
+              LOWMEM=1
+              ARM64ONLY=1
+              export RSYA_MEM_LEVEL=2
+              echo "Memori runner habis -> mode hemat RAM (heap kecil, 1 worker, hanya arm64), mengulang build"
+              python3 "$RUNNER_TEMP/rsya_patch.py" || true
+              attempt=$((attempt + 1))
+              continue
             fi
 
             # 0. Disk runner penuh -> bersihkan lalu ulangi sekali
@@ -1017,7 +1142,7 @@ jobs:
 
             # 1. Project punya ndk abiFilters -> bentrok dengan --split-per-abi. Ulangi tanpa split.
             if [ "$SPLIT" = "true" ] && grep -q "abiFilters cannot be present when splits abi filters are set" "$LOG"; then
-              echo "Project memakai ndk abiFilters, split per ABI dimatikan -> build 1 APK (arm + arm64)"
+              echo "Project memakai ndk abiFilters, split per ABI dimatikan -> build 1 APK"
               SPLIT="false"
               attempt=$((attempt + 1))
               continue
@@ -1040,12 +1165,16 @@ jobs:
               continue
             fi
 
-            # 4. Package pub gagal compile di Flutter ini -> upgrade package tsb
-            if rsya_guard "$LOG"; then
-              echo "::error::Upgrade package merusak kode project. Gunakan Flutter yang lebih lama (isi 'Versi Flutter' di Pengaturan Build)."
-              exit "$rc"
-            fi
-            if rsya_fix_pkgs "$LOG"; then
+            # 4. Error package / kode project -> resolver (cari versi package atau Flutter yang cocok), lalu ulangi
+            if [ ! -f "$RUNNER_TEMP/rsya_resolved" ] && { rsya_project_errors "$LOG" || [ -n "$(rsya_pkgs_from_log "$LOG")" ]; }; then
+              touch "$RUNNER_TEMP/rsya_resolved"
+              echo "Error package/kode project terdeteksi -> mencari versi package/Flutter yang cocok"
+              rsya_resolve
+              if [ -n "$RSYA_UNRESOLVED" ]; then
+                echo "::error::Package tidak kompatibel dengan $(flutter --version | head -1): $RSYA_UNRESOLVED"
+                echo "Solusi: isi 'Versi Flutter' di Pengaturan Build dengan versi lebih lama (mis. 3.32.x), atau perbarui package & kode project."
+                exit "$rc"
+              fi
               attempt=$((attempt + 1))
               continue
             fi
@@ -1067,4 +1196,15 @@ jobs:
             exit 1
           fi
           gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          # ZIP project tidak diperlukan lagi setelah build sukses (penting terutama untuk repo public)
+          gh release delete-asset "$TAG" project.zip --repo "$GITHUB_REPOSITORY" --yes || true
+
+      - name: Setup - simpan cache Gradle
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
